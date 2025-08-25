@@ -1,0 +1,275 @@
+import os
+import argparse
+import json
+import time
+import numpy as np
+import torch
+
+torch.backends.cudnn.enabled = True
+import torch.nn as nn
+import torch.nn.functional as F
+
+from configs.config import cfg, merge_cfg_from_file
+from datasets.datasets import create_dataset
+from models.modules import AddSpatialInfo, ChangeDetector
+from models.dynamic_speaker_change_pos import DynamicSpeaker
+
+from utils.utils import (
+    AverageMeter,
+    accuracy,
+    set_mode,
+    load_checkpoint,
+    decode_sequence,
+    coco_gen_format_save,
+)
+from tqdm import tqdm
+
+from utils.mimic_utils import process_matrix
+from pycocotools.coco import COCO
+from evaluation import my_COCOEvalCap
+
+# Load config
+parser = argparse.ArgumentParser()
+parser.add_argument("--cfg", default="configs/dynamic/dynamic_change_pos_mimic.yaml")
+parser.add_argument(
+    "-p",
+    "--resume_checkpoint",
+    type=str,
+    default="./experiments/final/mode2_location_all_0.0001_coef0.333000-0.333000_2023-04-11-12-55-40_1238/snapshots/checkpoint_best.pt",
+)
+parser.add_argument("--gpu", type=int, default=-1)
+parser.add_argument(
+    "--feature_mode",
+    type=str,
+    default="both",
+    choices=["both", "coords", "location", "single_ana", "single_loc"],
+)
+parser.add_argument(
+    "--graph",
+    type=str,
+    default="all",
+    choices=["implicit", "semantic", "spatial", "all", "i+s"],
+)
+parser.add_argument("--use_allign", action="store_true", default=False, help="")
+
+
+def to_device(batch, device):
+    # Move each tensor in the batch to the specified device
+    return tuple(x.to(device) if isinstance(x, torch.Tensor) else x for x in batch)
+
+
+args = parser.parse_args()
+merge_cfg_from_file(args.cfg)
+# assert cfg.exp_name == os.path.basename(args.cfg).replace('.yaml', '')
+
+# Device configuration
+use_cuda = torch.cuda.is_available()
+if args.gpu == -1:
+    gpu_ids = cfg.gpu_id
+else:
+    gpu_ids = [args.gpu]
+torch.backends.cudnn.enabled = True
+default_gpu_device = gpu_ids[0]
+# torch.cuda.set_device(default_gpu_device)
+device = torch.device("cuda" if use_cuda else "cpu")
+
+# Experiment configuration
+exp_dir = cfg.exp_dir
+exp_name = "mimic-diff"
+
+output_dir = os.path.join(exp_dir, exp_name)
+
+test_output_dir = os.path.join(output_dir, "test_output")
+if not os.path.exists(test_output_dir):
+    os.makedirs(test_output_dir)
+caption_output_path = os.path.join(test_output_dir, "captions", "test")
+if not os.path.exists(caption_output_path):
+    os.makedirs(caption_output_path)
+att_output_path = os.path.join(test_output_dir, "attentions", "test")
+if not os.path.exists(att_output_path):
+    os.makedirs(att_output_path)
+
+cfg.train.graph = args.graph
+checkpoint = load_checkpoint(args.resume_checkpoint)
+change_detector_state = checkpoint["change_detector_state"]
+speaker_state = checkpoint["speaker_state"]
+annotation_file = "data/mimic_gt_captions_test.json"
+# Data loading part
+train_dataset, train_loader = create_dataset(cfg, "train")
+idx_to_word = train_dataset.get_idx_to_word()
+test_dataset, test_loader = create_dataset(cfg, "test")
+
+# Load modules
+change_detector = ChangeDetector(cfg, train_dataset.word_to_idx, args)
+change_detector.load_state_dict(change_detector_state)
+change_detector = change_detector.to(device)
+
+speaker = DynamicSpeaker(cfg, len(train_dataset.get_idx_to_word()) + 1)
+speaker.load_state_dict(speaker_state)
+speaker.to(device)
+
+spatial_info = AddSpatialInfo()
+spatial_info.to(device)
+
+print(change_detector)
+print(speaker)
+print(spatial_info)
+
+
+set_mode("eval", [change_detector, speaker])
+with torch.no_grad():
+    test_iter_start_time = time.time()
+
+    predictions = {}
+    result_sents_neg = {}
+    for i, batch in enumerate(tqdm(test_loader)):
+        val_batch = to_device(batch, device)
+        (
+            d_feats,
+            sc_feats,
+            labels,
+            sc_pos_labels,
+            masks,
+            pair_index,
+            d_adj_matrix,
+            q_adj_matrix,
+            d_sem_adj_matrix,
+            q_sem_dj_matrix,
+            d_bb,
+            q_bb,
+            question,
+            d_reaug_features,
+            q_reaug_features,
+            d_label_reaug,
+            q_label_reaug,
+            d_diseases_average,
+            q_diseases_average,
+            reaug_state_list,
+            d_reaug_bb,
+            q_reaug_bb,
+            rag_d_semantic_adj,
+            rag_q_semantic_adj,
+            rag_d_adj_matrix,
+            rag_q_adj_matrix,
+            question_mask,
+        ) = val_batch
+
+        batch_size = d_feats.size(0)
+
+        d_adj_matrix = process_matrix(d_adj_matrix, cfg, d_feats.shape[1], d_feats.device, type="spatial")
+        q_adj_matrix = process_matrix(q_adj_matrix, cfg, sc_feats.shape[1], sc_feats.device, type="spatial")
+
+        d_sem_adj_matrix = process_matrix(d_sem_adj_matrix, cfg, d_feats.shape[1], d_feats.device, type="semantic")
+        q_sem_adj_matrix = process_matrix(q_sem_dj_matrix, cfg, sc_feats.shape[1], sc_feats.device, type="semantic")
+        (
+            rag_d_adj_matrix,
+            rag_q_adj_matrix,
+            rag_d_semantic_adj,
+            rag_q_semantic_adj,
+        ) = (
+            rag_d_adj_matrix.reshape(-1, 100, 100),
+            rag_q_adj_matrix.reshape(-1, 100, 100),
+            rag_d_semantic_adj.reshape(-1, 100, 100),
+            rag_q_semantic_adj.reshape(-1, 100, 100),
+        )
+
+        rag_d_adj_matrix = process_matrix(rag_d_adj_matrix, cfg, d_feats.shape[1], d_feats.device, type="spatial")
+        rag_q_adj_matrix = process_matrix(
+            rag_q_adj_matrix,
+            cfg,
+            sc_feats.shape[1],
+            sc_feats.device,
+            type="spatial",
+        )
+        rag_d_semantic_adj = process_matrix(
+            rag_d_semantic_adj,
+            cfg,
+            d_feats.shape[1],
+            d_feats.device,
+            type="semantic",
+        )
+        rag_q_semantic_adj = process_matrix(
+            rag_q_semantic_adj,
+            cfg,
+            sc_feats.shape[1],
+            sc_feats.device,
+            type="semantic",
+        )
+        (
+            chg_pos_logits,
+            chg_pos_att_bef,
+            chg_pos_att_aft,
+            chg_pos_feat_bef,
+            chg_pos_feat_aft,
+            chg_pos_feat_diff,
+            faiss_chg_pos_feat_bef,
+            faiss_chg_pos_feat_aft,
+            faiss_chg_pos_feat_diff,
+            rag_diff_state,
+            rag_label_state_out,
+            labels_emb_seq,
+        ) = change_detector(
+            d_feats,
+            sc_feats,
+            d_adj_matrix,
+            q_adj_matrix,
+            d_sem_adj_matrix,
+            q_sem_adj_matrix,
+            d_bb,
+            q_bb,
+            question,
+            d_reaug_features,
+            q_reaug_features,
+            reaug_state_list,
+            d_reaug_bb,
+            q_reaug_bb,
+            rag_d_semantic_adj,
+            rag_q_semantic_adj,
+            rag_d_adj_matrix,
+            rag_q_adj_matrix,
+            labels,
+            question_mask,
+            setting=cfg.train.setting,
+            graph=args.graph,
+        )
+
+        speaker_output_pos, _ = speaker._sample(
+            chg_pos_feat_bef,
+            chg_pos_feat_aft,
+            chg_pos_feat_diff,
+            labels,
+            faiss_chg_pos_feat_bef,
+            faiss_chg_pos_feat_aft,
+            faiss_chg_pos_feat_diff,
+            rag_diff_state,
+            cfg,
+            sample_max=1,
+        )
+
+        gen_sents_pos = decode_sequence(idx_to_word, speaker_output_pos)
+
+        chg_pos_att_bef = chg_pos_att_bef.cpu().numpy()
+        chg_pos_att_aft = chg_pos_att_aft.cpu().numpy()
+
+        dummy = np.ones_like(chg_pos_att_bef)
+        for j in range(batch_size):
+            predict_sent = gen_sents_pos[j]
+            predictions[str(int(pair_index[j]))] = predict_sent
+
+    test_iter_end_time = time.time() - test_iter_start_time
+    print("Test took %.4f seconds" % test_iter_end_time)
+
+    result_save_path_pos = os.path.join(caption_output_path, "test_results_%s.json" % args.feature_mode)
+    print(result_save_path_pos)
+    coco_gen_format_save(predictions, result_save_path_pos)
+
+    coco = COCO(annotation_file)
+    coco_result = coco.loadRes(result_save_path_pos)
+    coco_eval = my_COCOEvalCap(coco, coco_result)
+    coco_eval.params["image_id"] = coco_result.getImgIds()
+    coco_eval.evaluate()
+    # print output evaluation scores
+    output = []
+    for metric, score in coco_eval.eval.items():
+        print(f"{metric}: {score:.3f}")
+        output.append(score)
