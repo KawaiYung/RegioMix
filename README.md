@@ -7,7 +7,6 @@
 This repository builds heavily on the prior work **EKAID** ([GitHub link](https://github.com/Holipori/EKAID/tree/main)).  
 For detailed instructions on data preparation, please refer to the  [feature extraction guide](https://github.com/Holipori/EKAID/tree/main/feature%20extraction)
 
-The cxr-record-list.csv can be found in the original [MIMIC-CXR Database](https://physionet.org/content/mimic-cxr/2.1.0/) 
 
 
 ---
